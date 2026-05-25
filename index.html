@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Grist Report Display</title>
+    <script src="https://docs.getgrist.com/grist-plugin-api.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/handlebars@4.7.8/dist/handlebars.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.min.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet.markercluster@1.5.3/dist/MarkerCluster.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css">
+    <script src="https://cdn.jsdelivr.net/npm/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.4/build/qrcode.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #333; background: #fff; }
+        .report-loading { text-align: center; padding: 40px; color: #999; font-size: 13px; }
+        .report-error { text-align: center; padding: 40px; color: #e53935; font-size: 13px; }
+        .report-select { max-width: 400px; margin: 40px auto; text-align: center; }
+        .report-select h2 { font-size: 16px; margin-bottom: 12px; color: #555; }
+        .report-select select { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 8px; font-size: 13px; }
+        .report-select button { margin-top: 12px; padding: 8px 20px; background: #16b378; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 12px; }
+        @media print { body { padding: 0; } }
+    </style>
+</head>
+<body>
+<div id="app"><div class="report-loading">Connecting to Grist...</div></div>
+<script>
+(async function() {
+    "use strict";
+    const REPORTS_TABLE = "SysReports";
+    const WIDGET_NAME = "Report Display";
+    const WIDGET_VERSION = "1.0.0";
+    const app = document.getElementById("app");
+
+    grist.ready({ requiredAccess: "full", columns: [] });
+
+    async function fetchTable(tableId) {
+        const data = await grist.docApi.fetchTable(tableId);
+        const columns = Object.keys(data);
+        if (columns.length === 0) return [];
+        const rowCount = data.id ? data.id.length : data[columns[0]].length;
+        const rows = [];
+        for (let i = 0; i < rowCount; i++) {
+            const row = {};
+            for (const col of columns) row[col] = data[col][i];
+            rows.push(row);
+        }
+        return rows;
+    }
+
+    // ── Helpers (same as report_writer) ────────────────────────────────────
+    const H = Handlebars;
+    H.registerHelper("eq", (a, b) => a === b);
+    H.registerHelper("neq", (a, b) => a !== b);
+    H.registerHelper("gt", (a, b) => a > b);
+    H.registerHelper("lt", (a, b) => a < b);
+    H.registerHelper("gte", (a, b) => a >= b);
+    H.registerHelper("lte", (a, b) => a <= b);
+    H.registerHelper("and", (a, b) => a && b);
+    H.registerHelper("or", (a, b) => a || b);
+    H.registerHelper("not", (a) => !a);
+    H.registerHelper("add", (a, b) => Number(a) + Number(b));
+    H.registerHelper("subtract", (a, b) => Number(a) - Number(b));
+    H.registerHelper("multiply", (a, b) => Number(a) * Number(b));
+    H.registerHelper("divide", (a, b) => b !== 0 ? Number(a) / Number(b) : 0);
+    H.registerHelper("percent", (a, b) => b !== 0 ? ((a / b) * 100).toFixed(1) + "%" : "0%");
+    H.registerHelper("round", (n, d) => Number(n).toFixed(typeof d === "number" ? d : 0));
+    H.registerHelper("count", (arr) => Array.isArray(arr) ? arr.length : 0);
+    H.registerHelper("sum", function(arr, key) { if (!Array.isArray(arr)) return 0; return arr.reduce((s, i) => s + (Number(i[key]) || 0), 0); });
+    H.registerHelper("avg", function(arr, key) { if (!Array.isArray(arr) || !arr.length) return 0; return (arr.reduce((s, i) => s + (Number(i[key]) || 0), 0) / arr.length).toFixed(1); });
+    H.registerHelper("max", function(arr, key) { if (!Array.isArray(arr) || !arr.length) return 0; return Math.max(...arr.map(i => Number(i[key]) || 0)); });
+    H.registerHelper("min", function(arr, key) { if (!Array.isArray(arr) || !arr.length) return 0; return Math.min(...arr.map(i => Number(i[key]) || 0)); });
+    H.registerHelper("unique", function(arr, key) { if (!Array.isArray(arr)) return []; return [...new Set(arr.map(i => i[key]).filter(Boolean))]; });
+    H.registerHelper("groupBy", function(arr, key, options) { if (!Array.isArray(arr)) return ""; const g = {}; arr.forEach(i => { const k = i[key] || "(blank)"; if (!g[k]) g[k] = []; g[k].push(i); }); let o = ""; for (const [k, items] of Object.entries(g)) o += options.fn({ key: k, items, count: items.length }); return o; });
+    H.registerHelper("filterBy", function(arr, key, value, options) { if (!Array.isArray(arr)) return ""; const f = arr.filter(i => i[key] === value); return options.fn({ items: f, count: f.length }); });
+    H.registerHelper("sortBy", function(arr, key, dir) { if (!Array.isArray(arr)) return []; const s = [...arr].sort((a, b) => a[key] < b[key] ? -1 : a[key] > b[key] ? 1 : 0); return dir === "desc" ? s.reverse() : s; });
+    H.registerHelper("formatDate", (val) => { if (!val) return ""; return new Date(val * 1000).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }); });
+    H.registerHelper("formatDateTime", (val) => { if (!val) return ""; const d = new Date(val * 1000); return d.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }) + " " + d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }); });
+    H.registerHelper("now", () => new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }));
+    H.registerHelper("year", (val) => val ? new Date(val * 1000).getFullYear() : new Date().getFullYear());
+    H.registerHelper("monthName", (m) => ["January","February","March","April","May","June","July","August","September","October","November","December"][m] || "");
+    H.registerHelper("dayOfWeek", (val) => { const d = new Date(val * 1000); return ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][d.getDay()]; });
+    H.registerHelper("uppercase", (s) => String(s || "").toUpperCase());
+    H.registerHelper("lowercase", (s) => String(s || "").toLowerCase());
+    H.registerHelper("truncate", (s, len) => { const str = String(s || ""); return str.length > len ? str.slice(0, len) + "..." : str; });
+    H.registerHelper("replace", (s, find, rep) => String(s || "").replace(new RegExp(find, "g"), rep));
+    H.registerHelper("json", (obj) => JSON.stringify(obj));
+    H.registerHelper("pageBreak", () => new H.SafeString('<div style="page-break-after: always;"></div>'));
+    H.registerHelper("columns", function(count, options) { return new H.SafeString(`<div style="column-count:${count}; column-gap:16px;">${options.fn(this)}</div>`); });
+    H.registerHelper("progressBar", function(value, max) { const pct = max > 0 ? Math.min(100, Math.round((value / max) * 100)) : 0; return new H.SafeString(`<div style="background:#eee;border-radius:4px;height:8px;width:100%;overflow:hidden;"><div style="background:#16b378;height:100%;width:${pct}%;border-radius:4px;"></div></div>`); });
+    H.registerHelper("stars", function(value, max) { const m = max || 5; const v = Math.round(Number(value) || 0); let s = ""; for (let i = 1; i <= m; i++) s += i <= v ? "★" : "☆"; return new H.SafeString(`<span style="color:#f4a261;letter-spacing:1px;">${s}</span>`); });
+    H.registerHelper("initials", function(name) { const parts = String(name || "").split(" ").filter(Boolean); const ini = parts.map(p => p[0]).join("").toUpperCase().slice(0, 2); const colours = ["#16b378","#e63946","#457b9d","#f4a261","#6a4c93","#2a9d8f","#e76f51","#264653"]; const colour = colours[ini.charCodeAt(0) % colours.length]; return new H.SafeString(`<span style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:50%;background:${colour};color:#fff;font-size:11px;font-weight:700;">${ini}</span>`); });
+    H.registerHelper("timeAgo", function(timestamp) { if (!timestamp) return ""; const now = Date.now() / 1000; const diff = now - timestamp; if (diff < 60) return "just now"; if (diff < 3600) return Math.floor(diff / 60) + " min ago"; if (diff < 86400) return Math.floor(diff / 3600) + " hours ago"; if (diff < 2592000) return Math.floor(diff / 86400) + " days ago"; if (diff < 31536000) return Math.floor(diff / 2592000) + " months ago"; return Math.floor(diff / 31536000) + " years ago"; });
+    H.registerHelper("formatNumber", function(n) { return Number(n || 0).toLocaleString("en-GB"); });
+    H.registerHelper("currency", function(value, code) { const c = code || "GBP"; try { return Number(value || 0).toLocaleString("en-GB", { style: "currency", currency: c }); } catch(e) { return Number(value || 0).toFixed(2); } });
+    H.registerHelper("watermark", function(text) { return new H.SafeString(`<div style="position:fixed;top:50%;left:50%;transform:translate(-50%,-50%) rotate(-35deg);font-size:80px;font-weight:700;color:rgba(0,0,0,0.04);pointer-events:none;z-index:0;white-space:nowrap;">${text || "DRAFT"}</div>`); });
+    H.registerHelper("signatureLine", function(label) { return new H.SafeString(`<div style="margin-top:40px;padding-top:8px;border-top:1px solid #333;width:250px;font-size:11px;color:#666;">${label || "Signature"}</div>`); });
+    H.registerHelper("labels", function(cols, options) { const c = Number(cols) || 3; return new H.SafeString(`<div style="display:grid;grid-template-columns:repeat(${c},1fr);gap:8px;">${options.fn(this)}</div>`); });
+
+    // ── Rendering functions (same as report_writer) ────────────────────────
+    const COLOURS = ["#16b378","#e63946","#457b9d","#f4a261","#6a4c93","#2a9d8f","#e76f51","#264653","#84a98c","#d62828","#003049","#fcbf49"];
+
+    function renderCharts(container, data) {
+        container.querySelectorAll("canvas[data-chart]").forEach(canvas => { try { new Chart(canvas, JSON.parse(canvas.dataset.chart)); } catch(e) {} });
+        container.querySelectorAll("canvas[data-chart-type]").forEach(canvas => {
+            try {
+                const type = canvas.dataset.chartType, tableData = data[canvas.dataset.chartTable];
+                const groupField = canvas.dataset.chartGroup, labelField = canvas.dataset.chartLabel;
+                const valueField = canvas.dataset.chartValue, title = canvas.dataset.chartTitle || "";
+                if (!Array.isArray(tableData)) return;
+                let labels, values;
+                if (groupField) { const g = {}; tableData.forEach(r => { const k = r[groupField] || "(blank)"; g[k] = (g[k] || 0) + (valueField ? (Number(r[valueField]) || 0) : 1); }); labels = Object.keys(g); values = Object.values(g); }
+                else { labels = tableData.map(r => r[labelField] || ""); values = tableData.map(r => Number(r[valueField]) || 0); }
+                new Chart(canvas, { type, data: { labels, datasets: [{ label: title, data: values, backgroundColor: type === "line" ? COLOURS[0] : labels.map((_, i) => COLOURS[i % COLOURS.length]), borderColor: type === "line" ? COLOURS[0] : undefined, borderWidth: type === "line" ? 2 : 1, fill: false }] }, options: { responsive: true, plugins: { title: { display: !!title, text: title }, legend: { display: type === "pie" || type === "doughnut" } }, scales: (type === "bar" || type === "line") ? { y: { beginAtZero: true } } : undefined } });
+            } catch(e) {}
+        });
+    }
+
+    function renderMaps(container, data) {
+        container.querySelectorAll("[data-map]").forEach(el => {
+            try {
+                const tableData = data[el.dataset.mapTable], latField = el.dataset.mapLat || "Latitude", lngField = el.dataset.mapLng || "Longitude";
+                const labelField = el.dataset.mapLabel || "", colourField = el.dataset.mapColour || "";
+                const useCluster = el.dataset.mapCluster === "true", useHeat = el.dataset.mapHeat === "true";
+                if (!Array.isArray(tableData)) return;
+                const points = tableData.filter(r => r[latField] && r[lngField] && r[latField] !== 0);
+                if (points.length === 0) { el.innerHTML = "<p style='color:#999;text-align:center;padding:20px;'>No coordinates</p>"; return; }
+                el.style.minHeight = el.style.height || "400px";
+                const map = L.map(el).setView([points[0][latField], points[0][lngField]], 3);
+                L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { attribution: "© OpenStreetMap" }).addTo(map);
+                if (useHeat) { L.heatLayer(points.map(r => [Number(r[latField]), Number(r[lngField]), 1]), { radius: 20, blur: 15 }).addTo(map); }
+                else { const colourMap = {}; let ci = 0; const layer = useCluster ? L.markerClusterGroup() : L.layerGroup(); points.forEach(r => { const lat = Number(r[latField]), lng = Number(r[lngField]); if (isNaN(lat) || isNaN(lng)) return; let c = COLOURS[0]; if (colourField && r[colourField]) { if (!colourMap[r[colourField]]) colourMap[r[colourField]] = COLOURS[ci++ % COLOURS.length]; c = colourMap[r[colourField]]; } const m = L.circleMarker([lat, lng], { radius: 6, fillColor: c, color: "#fff", weight: 1, fillOpacity: 0.8 }); if (labelField && r[labelField]) m.bindPopup(String(r[labelField])); layer.addLayer(m); }); map.addLayer(layer); }
+                map.fitBounds(L.latLngBounds(points.map(r => [r[latField], r[lngField]])), { padding: [20, 20] });
+            } catch(e) {}
+        });
+    }
+
+    function renderQRCodes(container) { container.querySelectorAll("[data-qr]").forEach(el => { try { const v = el.dataset.qr, s = parseInt(el.dataset.qrSize) || 128; if (!v) return; const c = document.createElement("canvas"); QRCode.toCanvas(c, v, { width: s, margin: 1 }, () => el.appendChild(c)); } catch(e) {} }); }
+    function renderBarcodes(container) { container.querySelectorAll("[data-barcode]").forEach(el => { try { const v = el.dataset.barcode, f = el.dataset.barcodeFormat || "CODE128"; if (!v) return; const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg"); el.appendChild(svg); JsBarcode(svg, v, { format: f, height: 40, displayValue: true, fontSize: 12 }); } catch(e) {} }); }
+
+    // ── Report renderer ────────────────────────────────────────────────────
+    async function renderReport(report, selectedRecord) {
+        app.innerHTML = `<div class="report-loading">Loading...</div>`;
+        try {
+            const mode = (report.Filter_Mode || "all").trim().toLowerCase();
+            const targets = report.Data_Tables ? report.Data_Tables.split(",").map(t => t.trim()) : [];
+            const primaryTable = report.Link_Table ? report.Link_Table.trim() : targets[0];
+            const data = {};
+            await Promise.all(targets.map(async (table) => { data[table] = await fetchTable(table); }));
+
+            if (mode === "record" && selectedRecord && selectedRecord.id) {
+                if (primaryTable && data[primaryTable]) data[primaryTable] = data[primaryTable].filter(row => row.id === selectedRecord.id);
+                const selectedId = selectedRecord.id;
+                for (const table of targets.filter(t => t !== primaryTable)) {
+                    if (!data[table] || data[table].length === 0) continue;
+                    const refCols = Object.keys(data[table][0] || {}).filter(col => col === primaryTable || col === primaryTable.replace(/s$/, "") || col === primaryTable + "_ID" || col === "Contact" || col === "Organisation");
+                    if (refCols.length > 0) data[table] = data[table].filter(row => refCols.some(col => row[col] === selectedId));
+                }
+                data._selected = selectedRecord;
+            }
+
+            data._meta = { reportName: report.Report_Name, generatedAt: new Date().toLocaleString("en-GB"), recordCounts: {} };
+            for (const [t, rows] of Object.entries(data)) { if (t !== "_meta" && t !== "_selected") data._meta.recordCounts[t] = Array.isArray(rows) ? rows.length : 0; }
+
+            const template = H.compile(report.Template_HTML || "");
+            const html = template(data);
+            app.innerHTML = html;
+
+            renderCharts(app, data);
+            renderMaps(app, data);
+            renderQRCodes(app);
+            renderBarcodes(app);
+        } catch(e) {
+            app.innerHTML = `<div class="report-error">Error: ${e.message}</div>`;
+        }
+    }
+
+    // ── Report selection UI ──────────────────────────────────────────────────
+    let reports = [];
+    let selectedReportId = null;
+    let currentRecord = null;
+
+    function showSelector() {
+        if (reports.length === 0) { app.innerHTML = `<div class="report-error">No active reports found.</div>`; return; }
+        let opts = reports.map(r => `<option value="${r.id}">${r.Report_Name}</option>`).join("");
+        app.innerHTML = `<div class="report-select">
+            <h2>Select Report to Display</h2>
+            <select id="report-choice">${opts}</select>
+            <br><button onclick="lockReport()">Lock This Report</button>
+            <p style="font-size:11px; color:#999; margin-top:12px;">Once locked, this widget will always show the selected report.<br>To change, remove and re-add the widget.</p>
+        </div>`;
+    }
+
+    window.lockReport = () => {
+        const id = Number(document.getElementById("report-choice").value);
+        selectedReportId = id;
+        // Save selection via widget options
+        grist.setOption("reportId", id);
+        const report = reports.find(r => r.id === id);
+        if (report) renderReport(report, currentRecord);
+    };
+
+    // ── Initialise ──────────────────────────────────────────────────────────
+    grist.onRecord((record) => {
+        if (record && record.id) {
+            currentRecord = record;
+            if (selectedReportId) {
+                const report = reports.find(r => r.id === selectedReportId);
+                if (report && (report.Filter_Mode || "all").trim() === "record") {
+                    renderReport(report, currentRecord);
+                }
+            }
+        }
+    });
+
+    grist.onOptions((options) => {
+        if (options && options.reportId) {
+            selectedReportId = Number(options.reportId);
+        }
+    });
+
+    setTimeout(async () => {
+        try {
+            reports = await fetchTable(REPORTS_TABLE);
+            reports = reports.filter(r => r.Active === true);
+
+            if (selectedReportId) {
+                const report = reports.find(r => r.id === selectedReportId);
+                if (report) { renderReport(report, currentRecord); return; }
+            }
+            showSelector();
+        } catch(e) {
+            app.innerHTML = `<div class="report-error">Error: ${e.message}</div>`;
+        }
+    }, 500);
+
+})();
+</script>
+</body>
+</html>
